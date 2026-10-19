@@ -1,0 +1,12 @@
+services:
+  huawei-health-mcp:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"   # 只绑本机，对外走反向代理 HTTPS + 鉴权
+    environment:
+      TZ: Asia/Shanghai
+      DATA_DIR: /data
+      SYNC_INTERVAL_HOURS: 2
+    volumes:
+      - ./data:/data            # SQLite + 密钥落盘，权限 600
