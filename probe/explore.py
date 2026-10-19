@@ -3,11 +3,14 @@
 调用间隔 ≥1 秒，遵守任务书 §9 红线 4。
 """
 import json
+import os
 import sys
 import time
 from datetime import date, timedelta
 
-sys.path.insert(0, "/home/hatch/workspace/huawei-health-mcp")
+_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _BASE_DIR not in sys.path:
+    sys.path.insert(0, _BASE_DIR)
 
 from hwclient.client import HuaweiHealthClient, day_int
 from hwclient.const import SESSION_SPORT_TYPES

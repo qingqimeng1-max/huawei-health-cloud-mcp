@@ -1,16 +1,22 @@
 """同步逻辑：任务书 §4。按指标拉 [游标-3天, 今天]，写 SQLite。
 
-日志只打计数和状态，不打原始健康数据值。
+- 日志只打计数和状态，不打原始健康数据值。
+- 成功才推进游标（set_cursor_ok）；失败只记错误+失败计数，不推进游标（set_cursor_error）。
+- SYNC_LOCK 保证同一进程内不会有两个同步同时跑（对应代码评审问题 4）。
 """
 from __future__ import annotations
 
 import logging
+import os
 import sys
+import threading
 import time
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, "/home/hatch/workspace/huawei-health-mcp")
+_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _BASE_DIR not in sys.path:
+    sys.path.insert(0, _BASE_DIR)
 
 from hwclient.client import (
     HuaweiHealthClient,
@@ -28,6 +34,9 @@ _LOGGER = logging.getLogger("sync")
 TZ = ZoneInfo("Asia/Shanghai")
 BACKFILL_DAYS = 3      # 回溯窗口（任务书 §4.5）
 FIRST_SYNC_DAYS = 30   # 首次全量最多回溯（任务书 §4.5）
+
+# 进程内同步互斥锁：后台调度与手动执行不会并发
+SYNC_LOCK = threading.Lock()
 
 
 def _ymd_range(synced_until: int | None) -> tuple[int, int]:
@@ -70,6 +79,8 @@ def _get_client() -> HuaweiHealthClient:
 
 def sync_steps(client: HuaweiHealthClient) -> int:
     start, end = _ymd_range(store.get_cursor("steps"))
+    t0 = time.time()
+    store.mark_run_start("steps")
     resp = client.sports_stat(start, end)
     totals = daily_totals(daily_activity(resp.get("sportStat") or []))
     n = 0
@@ -80,13 +91,15 @@ def sync_steps(client: HuaweiHealthClient) -> int:
             "kcal": row.get("kcal"),
         })
         n += 1
-    store.set_cursor("steps", end)
+    store.set_cursor_ok("steps", end, duration_s=time.time() - t0)
     _LOGGER.info("steps: %d 天已同步", n)
     return n
 
 
 def sync_heart_rate(client: HuaweiHealthClient) -> int:
     start, end = _ymd_range(store.get_cursor("heart_rate"))
+    t0 = time.time()
+    store.mark_run_start("heart_rate")
     resp = client.health_stat(start, end, [7])
     n = 0
     for rec in resp.get("heartRateTotal") or []:
@@ -100,13 +113,15 @@ def sync_heart_rate(client: HuaweiHealthClient) -> int:
             "hr_max": basic.get("maxHeartRate") or None,
         })
         n += 1
-    store.set_cursor("heart_rate", end)
+    store.set_cursor_ok("heart_rate", end, duration_s=time.time() - t0)
     _LOGGER.info("heart_rate: %d 天已同步", n)
     return n
 
 
 def sync_sleep(client: HuaweiHealthClient) -> int:
     start, end = _ymd_range(store.get_cursor("sleep"))
+    t0 = time.time()
+    store.mark_run_start("sleep")
     resp = client.health_stat(start, end, [9])
     n = 0
     for rec in resp.get("professionalSleepTotal") or []:
@@ -127,13 +142,15 @@ def sync_sleep(client: HuaweiHealthClient) -> int:
             "spo2_avg": spo2,
         })
         n += 1
-    store.set_cursor("sleep", end)
+    store.set_cursor_ok("sleep", end, duration_s=time.time() - t0)
     _LOGGER.info("sleep: %d 天已同步", n)
     return n
 
 
 def sync_workouts(client: HuaweiHealthClient) -> int:
     start, end = _ymd_range(store.get_cursor("workouts"))
+    t0 = time.time()
+    store.mark_run_start("workouts")
     records = client._by_time_range(
         lambda a, b: client.sports_detail(a, b, SESSION_SPORT_TYPES), start, end)
     sessions = sport_sessions(records)
@@ -161,26 +178,34 @@ def sync_workouts(client: HuaweiHealthClient) -> int:
             per_day[day] = per_day.get(day, 0) + 1
     for day, cnt in per_day.items():
         store.upsert_daily(day, {"workout_count": cnt})
-    store.set_cursor("workouts", end)
+    store.set_cursor_ok("workouts", end, duration_s=time.time() - t0)
     _LOGGER.info("workouts: %d 条已同步", len(sessions))
     return len(sessions)
 
 
 def sync_all() -> dict:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    client = _get_client()
-    results = {}
-    for name, fn in [("steps", sync_steps), ("heart_rate", sync_heart_rate),
-                     ("sleep", sync_sleep), ("workouts", sync_workouts)]:
-        try:
-            results[name] = fn(client)
-            time.sleep(0.6)  # 请求间隔 ≥500ms（任务书 §7）
-        except Exception as e:  # noqa: BLE001
-            _LOGGER.error("%s 同步失败: %s: %s", name, type(e).__name__, e)
-            store.set_cursor(name, store.get_cursor(name) or 0, error=f"{type(e).__name__}: {e}")
-            results[name] = f"ERROR: {e}"
-    return results
+    """全量同步。加进程锁防止并发；单指标失败不影响其他指标，不推进失败指标的游标。"""
+    if not SYNC_LOCK.acquire(blocking=False):
+        _LOGGER.warning("已有同步在运行，本次跳过")
+        return {"skipped": "another sync is running"}
+    try:
+        client = _get_client()
+        results = {}
+        for name, fn in [("steps", sync_steps), ("heart_rate", sync_heart_rate),
+                         ("sleep", sync_sleep), ("workouts", sync_workouts)]:
+            try:
+                results[name] = fn(client)
+                time.sleep(0.6)  # 请求间隔 ≥500ms（任务书 §7）
+            except Exception as e:  # noqa: BLE001
+                _LOGGER.error("%s 同步失败: %s: %s", name, type(e).__name__, e)
+                store.set_cursor_error(name, f"{type(e).__name__}: {e}")
+                results[name] = f"ERROR: {e}"
+        return results
+    finally:
+        SYNC_LOCK.release()
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
     print(sync_all())

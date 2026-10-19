@@ -1,6 +1,10 @@
 """SQLite 存储层：任务书 §5 的两级表 + 同步游标（kv_store 由 token_store 管理）。
 
 所有时间统一存 UTC 毫秒；daily_summary.day 用本地日期字符串。
+
+游标语义（修复误报）：
+- 成功：set_cursor_ok() 推进 synced_until，更新 last_ok_at，清 last_error，fail_count 归零
+- 失败：set_cursor_error() 只记 last_error，fail_count+1，不碰 synced_until 和 last_ok_at
 """
 from __future__ import annotations
 
@@ -10,7 +14,9 @@ import stat
 import sys
 import time
 
-sys.path.insert(0, "/home/hatch/workspace/huawei-health-mcp")
+_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _BASE_DIR not in sys.path:
+    sys.path.insert(0, _BASE_DIR)
 
 from app.token_store import DB_PATH, DATA_DIR  # noqa: E402
 
@@ -47,9 +53,30 @@ CREATE TABLE IF NOT EXISTS daily_summary (
 );
 
 CREATE TABLE IF NOT EXISTS sync_cursor (
-  metric TEXT PRIMARY KEY, synced_until INTEGER, last_ok_at INTEGER, last_error TEXT
+  metric TEXT PRIMARY KEY,
+  synced_until INTEGER,
+  last_ok_at INTEGER,
+  last_error TEXT,
+  fail_count INTEGER DEFAULT 0,
+  last_run_at INTEGER,
+  last_duration_s REAL
 );
 """
+
+# 老版本 sync_cursor 只有 4 列，启动时补齐
+_MIGRATIONS = [
+    "ALTER TABLE sync_cursor ADD COLUMN fail_count INTEGER DEFAULT 0",
+    "ALTER TABLE sync_cursor ADD COLUMN last_run_at INTEGER",
+    "ALTER TABLE sync_cursor ADD COLUMN last_duration_s REAL",
+]
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(sync_cursor)")}
+    for sql in _MIGRATIONS:
+        col = sql.split("ADD COLUMN")[1].split()[0]
+        if col not in cols:
+            conn.execute(sql)
 
 
 def get_db() -> sqlite3.Connection:
@@ -60,6 +87,7 @@ def get_db() -> sqlite3.Connection:
     if fresh:
         os.chmod(DB_PATH, stat.S_IRUSR | stat.S_IWUSR)
     conn.executescript(SCHEMA)
+    _migrate(conn)
     # kv_store 由 token_store 创建，这里兜底
     conn.execute(
         "CREATE TABLE IF NOT EXISTS kv_store ("
@@ -122,17 +150,64 @@ def get_cursor(metric: str) -> int | None:
         conn.close()
 
 
-def set_cursor(metric: str, synced_until: int, error: str | None = None) -> None:
+def get_cursor_status(metric: str) -> dict | None:
+    """取某指标的完整同步状态（含 fail_count，供健康检查用）。"""
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT * FROM sync_cursor WHERE metric=?", (metric,)
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def mark_run_start(metric: str) -> None:
     conn = get_db()
     try:
         conn.execute(
-            """INSERT INTO sync_cursor (metric, synced_until, last_ok_at, last_error)
-               VALUES (?,?,?,?)
+            """INSERT INTO sync_cursor (metric, last_run_at)
+               VALUES (?, ?)
+               ON CONFLICT(metric) DO UPDATE SET last_run_at=excluded.last_run_at""",
+            (metric, int(time.time())),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def set_cursor_ok(metric: str, synced_until: int, duration_s: float | None = None) -> None:
+    """同步成功：推进游标，更新 last_ok_at，清掉错误和失败计数。"""
+    conn = get_db()
+    try:
+        conn.execute(
+            """INSERT INTO sync_cursor
+               (metric, synced_until, last_ok_at, last_error, fail_count, last_duration_s)
+               VALUES (?,?,?,?,0,?)
                ON CONFLICT(metric) DO UPDATE SET
                  synced_until=excluded.synced_until,
                  last_ok_at=excluded.last_ok_at,
-                 last_error=excluded.last_error""",
-            (metric, synced_until, int(time.time()), error),
+                 last_error=NULL,
+                 fail_count=0,
+                 last_duration_s=excluded.last_duration_s""",
+            (metric, synced_until, int(time.time()), None, duration_s),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def set_cursor_error(metric: str, error: str) -> None:
+    """同步失败：只记错误和失败计数，不推进游标，不碰 last_ok_at。"""
+    conn = get_db()
+    try:
+        conn.execute(
+            """INSERT INTO sync_cursor (metric, last_error, fail_count)
+               VALUES (?,?,1)
+               ON CONFLICT(metric) DO UPDATE SET
+                 last_error=excluded.last_error,
+                 fail_count=COALESCE(sync_cursor.fail_count, 0) + 1""",
+            (metric, error),
         )
         conn.commit()
     finally:

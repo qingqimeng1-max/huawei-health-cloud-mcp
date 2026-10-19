@@ -3,10 +3,13 @@
 
 授权码只在内存里用一次，不落盘、不打印。token 加密后才进 SQLite（600 权限）。
 """
+import os
 import sys
 from datetime import date, timedelta
 
-sys.path.insert(0, "/home/hatch/workspace/huawei-health-mcp")
+_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _BASE_DIR not in sys.path:
+    sys.path.insert(0, _BASE_DIR)
 
 from hwclient.client import (
     HuaweiHealthClient,

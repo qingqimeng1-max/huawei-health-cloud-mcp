@@ -7,6 +7,8 @@ services:
     environment:
       TZ: Asia/Shanghai
       DATA_DIR: /data
+      KEY_DIR: /keys            # 密钥与数据库分离挂载，不要备份到一起
       SYNC_INTERVAL_HOURS: 2
     volumes:
-      - ./data:/data            # SQLite + 密钥落盘，权限 600
+      - ./data:/data            # SQLite 落盘，权限 600
+      - ./keys:/keys            # 加密密钥独立 volume，权限 600

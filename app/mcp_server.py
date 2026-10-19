@@ -2,10 +2,13 @@
 
 运行：.venv/bin/python app/mcp_server.py  （监听 127.0.0.1:8000/mcp）
 """
+import os
 import sys
 from datetime import date, timedelta
 
-sys.path.insert(0, "/home/hatch/workspace/huawei-health-mcp")
+_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _BASE_DIR not in sys.path:
+    sys.path.insert(0, _BASE_DIR)
 
 from fastmcp import FastMCP
 
@@ -171,13 +174,20 @@ async def health_check(request):
 
 @mcp.custom_route("/debug/last_sync", methods=["GET"])
 async def last_sync(request):
+    """各指标同步状态：游标、上次成功时间、失败计数、上次运行耗时。
+
+    fail_count>0 表示该指标最近一次同步失败（游标未推进，last_ok_at 是上次成功时间）。
+    """
     from starlette.responses import JSONResponse
     conn = store.get_db()
     try:
         rows = conn.execute(
-            "SELECT metric, synced_until, last_ok_at, last_error FROM sync_cursor"
+            "SELECT metric, synced_until, last_ok_at, last_error, fail_count,"
+            " last_run_at, last_duration_s FROM sync_cursor"
         ).fetchall()
-        return JSONResponse({"cursors": [dict(r) for r in rows]})
+        cursors = [dict(r) for r in rows]
+        failing = [c["metric"] for c in cursors if (c.get("fail_count") or 0) > 0]
+        return JSONResponse({"cursors": cursors, "failing_metrics": failing})
     finally:
         conn.close()
 

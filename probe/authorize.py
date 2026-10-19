@@ -3,9 +3,12 @@
 
 参数与任务书完全一致，不改。把打印出的 URL 发给用户走人工授权流程。
 """
+import os
 import sys
 
-sys.path.insert(0, "/home/hatch/workspace/huawei-health-mcp")
+_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _BASE_DIR not in sys.path:
+    sys.path.insert(0, _BASE_DIR)
 
 from hwclient.client import authorization_url
 

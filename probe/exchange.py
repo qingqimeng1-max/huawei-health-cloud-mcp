@@ -5,10 +5,13 @@
 授权码只在内存里用一次，不落盘、不打印、不进日志。
 验证标准：getSportsStat 返回的最近一天步数（与手机 App 首页对比由人工完成）。
 """
+import os
 import sys
 from datetime import date, timedelta
 
-sys.path.insert(0, "/home/hatch/workspace/huawei-health-mcp")
+_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _BASE_DIR not in sys.path:
+    sys.path.insert(0, _BASE_DIR)
 
 from hwclient.client import (
     HuaweiHealthClient,
